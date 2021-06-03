@@ -25,7 +25,7 @@ class TD3(object):
                  Q_lr, pi_lr, norm_eps, norm_clip, max_u, action_l2, clip_obs, scope, T,
                  rollout_batch_size, subtract_goals, relative_goals, clip_pos_returns, clip_return,
                  bc_loss, q_filter, num_demo, demo_batch_size, prm_loss_weight, aux_loss_weight,
-                 sample_transitions, gamma, reuse=False, policy_delay=1, **kwargs):
+                 sample_transitions, gamma, reuse=False, policy_delay=2, **kwargs):
         """Implementation of TD3 that is used in combination with Hindsight Experience Replay (HER).
             Added functionality to use demonstrations for training to Overcome exploration problem.
 
