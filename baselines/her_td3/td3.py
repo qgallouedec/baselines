@@ -264,7 +264,6 @@ class TD3(object):
     def _update(self, Q1_grad, Q2_grad, pi_grad):
         self.Q1_adam.update(Q1_grad, self.Q_lr)
         self.Q2_adam.update(Q2_grad, self.Q_lr)
-        self.j += 1
         if self.j%self.policy_delay==0:
             self.pi_adam.update(pi_grad, self.pi_lr)
 
@@ -280,13 +279,17 @@ class TD3(object):
                 transitions[k] = np.array(rolloutV)
         else:
             transitions = self.buffer.sample(self.batch_size) #otherwise only sample from primary buffer
-
+        # print(len(transitions)) = 8
+        # print(transitions.keys()) = 'o', 'u', 'g', 'info_is_success', 'ag', 'o_2', 'ag_2', 'r'
         o, o_2, g = transitions['o'], transitions['o_2'], transitions['g']
+        # print(len(o)) = 256
         ag, ag_2 = transitions['ag'], transitions['ag_2']
         transitions['o'], transitions['g'] = self._preprocess_og(o, ag, g)
         transitions['o_2'], transitions['g_2'] = self._preprocess_og(o_2, ag_2, g)
 
         transitions_batch = [transitions[key] for key in self.stage_shapes.keys()]
+        # print(self.stage_shapes.keys()) # ['g', 'o', 'u', 'o_2', 'g_2', 'r']
+        #print(transitions_batch[0][0]) #= [[-0.13 -0.10  0.25], ..., [-0.02  0.12  0.16]]
         return transitions_batch
 
     def stage_batch(self, batch=None):
@@ -299,14 +302,21 @@ class TD3(object):
         if stage:
             self.stage_batch()
         critic1_loss, critic2_loss, actor_loss, Q1_grad, Q2_grad, pi_grad = self._grads()
+        self.j += 1
         self._update(Q1_grad, Q2_grad, pi_grad)
         return critic1_loss, critic2_loss, actor_loss
+
+    def _init_pi_net(self):
+        self.sess.run(self.init_pi_net_op)
 
     def _init_target1_net(self):
         self.sess.run(self.init_target1_net_op)
     
     def _init_target2_net(self):
         self.sess.run(self.init_target2_net_op)
+
+    def update_pi_net(self):
+        self.sess.run(self.update_pi_net_op)
 
     def update_target1_net(self):
         self.sess.run(self.update_target1_net_op)
@@ -455,6 +465,7 @@ class TD3(object):
         # initialize all variables
         tf.variables_initializer(self._global_vars('')).run()
         self._sync_optimizers()
+        self._init_pi_net()
         self._init_target1_net()
         self._init_target2_net()
 

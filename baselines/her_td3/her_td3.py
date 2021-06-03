@@ -43,7 +43,9 @@ def train(*, policy, rollout_worker, evaluator,
             policy.store_episode(episode)
             for _ in range(n_batches):
                 policy.train()
+            policy.update_pi_net()
             policy.update_target1_net()
+            policy.update_target2_net()
 
         # test
         evaluator.clear_history()
