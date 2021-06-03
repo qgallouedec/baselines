@@ -25,7 +25,7 @@ class TD3(object):
                  Q_lr, pi_lr, norm_eps, norm_clip, max_u, action_l2, clip_obs, scope, T,
                  rollout_batch_size, subtract_goals, relative_goals, clip_pos_returns, clip_return,
                  bc_loss, q_filter, num_demo, demo_batch_size, prm_loss_weight, aux_loss_weight,
-                 sample_transitions, gamma, reuse=False, **kwargs):
+                 sample_transitions, gamma, reuse=False, policy_delay=1, **kwargs):
         """Implementation of TD3 that is used in combination with Hindsight Experience Replay (HER).
             Added functionality to use demonstrations for training to Overcome exploration problem.
 
@@ -100,6 +100,8 @@ class TD3(object):
         buffer_shapes['g'] = (buffer_shapes['g'][0], self.dimg)
         buffer_shapes['ag'] = (self.T, self.dimg)
 
+        self.j = 0 # counter for policy delay
+
         buffer_size = (self.buffer_size // self.rollout_batch_size) * self.rollout_batch_size
         self.buffer = ReplayBuffer(buffer_shapes, buffer_size, self.T, self.sample_transitions)
 
@@ -128,7 +130,7 @@ class TD3(object):
     def get_actions(self, o, ag, g, noise_eps=0., random_eps=0., use_target_net=False,
                     compute_Q=False):
         o, g = self._preprocess_og(o, ag, g)
-        policy = self.target1 if use_target_net else self.main
+        policy = self.target1 if use_target_net else self.main1
         # values to compute
         vals = [policy.pi_tf]
         if compute_Q:
@@ -243,22 +245,28 @@ class TD3(object):
         return self.buffer.get_current_size()
 
     def _sync_optimizers(self):
-        self.Q_adam.sync()
+        self.Q1_adam.sync()
+        self.Q2_adam.sync()
         self.pi_adam.sync()
 
     def _grads(self):
         # Avoid feed_dict here for performance!
-        critic_loss, actor_loss, Q_grad, pi_grad = self.sess.run([
-            self.Q_loss_tf,
-            self.main.Q_pi_tf,
-            self.Q_grad_tf,
+        critic1_loss, critic2_loss, actor_loss, Q1_grad, Q2_grad, pi_grad = self.sess.run([
+            self.Q1_loss_tf,
+            self.Q2_loss_tf,
+            self.main1.Q_pi_tf,
+            self.Q1_grad_tf,
+            self.Q2_grad_tf,
             self.pi_grad_tf
         ])
-        return critic_loss, actor_loss, Q_grad, pi_grad
+        return critic1_loss, critic2_loss, actor_loss, Q1_grad, Q2_grad, pi_grad
 
-    def _update(self, Q_grad, pi_grad):
-        self.Q_adam.update(Q_grad, self.Q_lr)
-        self.pi_adam.update(pi_grad, self.pi_lr)
+    def _update(self, Q1_grad, Q2_grad, pi_grad):
+        self.Q1_adam.update(Q1_grad, self.Q_lr)
+        self.Q2_adam.update(Q2_grad, self.Q_lr)
+        self.j += 1
+        if self.j%self.policy_delay==0:
+            self.pi_adam.update(pi_grad, self.pi_lr)
 
     def sample_batch(self):
         if self.bc_loss: #use demonstration buffer to sample as well if bc_loss flag is set TRUE
@@ -290,9 +298,9 @@ class TD3(object):
     def train(self, stage=True):
         if stage:
             self.stage_batch()
-        critic_loss, actor_loss, Q_grad, pi_grad = self._grads()
-        self._update(Q_grad, pi_grad)
-        return critic_loss, actor_loss
+        critic1_loss, critic2_loss, actor_loss, Q1_grad, Q2_grad, pi_grad = self._grads()
+        self._update(Q1_grad, Q2_grad, pi_grad)
+        return critic1_loss, critic2_loss, actor_loss
 
     def _init_target1_net(self):
         self.sess.run(self.init_target1_net_op)
@@ -342,10 +350,15 @@ class TD3(object):
         mask = np.concatenate((np.zeros(self.batch_size - self.demo_batch_size), np.ones(self.demo_batch_size)), axis = 0)
 
         # networks
-        with tf.variable_scope('main') as vs:
+        with tf.variable_scope('main1') as vs:
             if reuse:
                 vs.reuse_variables()
-            self.main = self.create_actor_critic(batch_tf, net_type='maoin', **self.__dict__)
+            self.main1 = self.create_actor_critic(batch_tf, net_type='main', **self.__dict__)
+            vs.reuse_variables()
+        with tf.variable_scope('main2') as vs:
+            if reuse:
+                vs.reuse_variables()
+            self.main2 = self.create_actor_critic(batch_tf, net_type='main', **self.__dict__)
             vs.reuse_variables()
         with tf.variable_scope('target1') as vs:
             if reuse:
@@ -356,7 +369,7 @@ class TD3(object):
             self.target1 = self.create_actor_critic(
                 target1_batch_tf, net_type='useless', **self.__dict__)
             vs.reuse_variables()
-        assert len(self._vars("main")) == len(self._vars("target1"))
+        assert len(self._vars("main1")) == len(self._vars("target1"))
 
         with tf.variable_scope('target2') as vs:
             if reuse:
@@ -367,7 +380,7 @@ class TD3(object):
             self.target2 = self.create_actor_critic(
                 target2_batch_tf, net_type='useless', **self.__dict__)
             vs.reuse_variables()
-        assert len(self._vars("main")) == len(self._vars("target2"))
+        assert len(self._vars("main2")) == len(self._vars("target2"))
 
         # loss functions
         target1_Q_pi_tf = self.target1.Q_pi_tf
@@ -376,52 +389,68 @@ class TD3(object):
         clip_range = (-self.clip_return, 0. if self.clip_pos_returns else np.inf)
         target_tf = tf.clip_by_value(batch_tf['r'] + self.gamma * target_Q_pi_tf, *clip_range)
 
-        self.Q_loss_tf = tf.reduce_mean(tf.square(tf.stop_gradient(target_tf) - self.main.Q_tf))
+        self.Q1_loss_tf = tf.reduce_mean(tf.square(tf.stop_gradient(target_tf) - self.main1.Q_tf)) #same target for both networks
+        self.Q2_loss_tf = tf.reduce_mean(tf.square(tf.stop_gradient(target_tf) - self.main2.Q_tf))
 
         if self.bc_loss ==1 and self.q_filter == 1 : # train with demonstrations and use bc_loss and q_filter both
-            maskMain = tf.reshape(tf.boolean_mask(self.main.Q_tf > self.main.Q_pi_tf, mask), [-1]) #where is the demonstrator action better than actor action according to the critic? choose those samples only
+            maskMain = tf.reshape(tf.boolean_mask(self.main1.Q_tf > self.main1.Q_pi_tf, mask), [-1]) #where is the demonstrator action better than actor action according to the critic? choose those samples only
             #define the cloning loss on the actor's actions only on the samples which adhere to the above masks
-            self.cloning_loss_tf = tf.reduce_sum(tf.square(tf.boolean_mask(tf.boolean_mask((self.main.pi_tf), mask), maskMain, axis=0) - tf.boolean_mask(tf.boolean_mask((batch_tf['u']), mask), maskMain, axis=0)))
-            self.pi_loss_tf = -self.prm_loss_weight * tf.reduce_mean(self.main.Q_pi_tf) #primary loss scaled by it's respective weight prm_loss_weight
-            self.pi_loss_tf += self.prm_loss_weight * self.action_l2 * tf.reduce_mean(tf.square(self.main.pi_tf / self.max_u)) #L2 loss on action values scaled by the same weight prm_loss_weight
+            self.cloning_loss_tf = tf.reduce_sum(tf.square(tf.boolean_mask(tf.boolean_mask((self.main1.pi_tf), mask), maskMain, axis=0) - tf.boolean_mask(tf.boolean_mask((batch_tf['u']), mask), maskMain, axis=0)))
+            self.pi_loss_tf = -self.prm_loss_weight * tf.reduce_mean(self.main1.Q_pi_tf) #primary loss scaled by it's respective weight prm_loss_weight
+            self.pi_loss_tf += self.prm_loss_weight * self.action_l2 * tf.reduce_mean(tf.square(self.main1.pi_tf / self.max_u)) #L2 loss on action values scaled by the same weight prm_loss_weight
             self.pi_loss_tf += self.aux_loss_weight * self.cloning_loss_tf #adding the cloning loss to the actor loss as an auxilliary loss scaled by its weight aux_loss_weight
 
         elif self.bc_loss == 1 and self.q_filter == 0: # train with demonstrations without q_filter
-            self.cloning_loss_tf = tf.reduce_sum(tf.square(tf.boolean_mask((self.main.pi_tf), mask) - tf.boolean_mask((batch_tf['u']), mask)))
-            self.pi_loss_tf = -self.prm_loss_weight * tf.reduce_mean(self.main.Q_pi_tf)
-            self.pi_loss_tf += self.prm_loss_weight * self.action_l2 * tf.reduce_mean(tf.square(self.main.pi_tf / self.max_u))
+            self.cloning_loss_tf = tf.reduce_sum(tf.square(tf.boolean_mask((self.main1.pi_tf), mask) - tf.boolean_mask((batch_tf['u']), mask)))
+            self.pi_loss_tf = -self.prm_loss_weight * tf.reduce_mean(self.main1.Q_pi_tf)
+            self.pi_loss_tf += self.prm_loss_weight * self.action_l2 * tf.reduce_mean(tf.square(self.main1.pi_tf / self.max_u))
             self.pi_loss_tf += self.aux_loss_weight * self.cloning_loss_tf
 
         else: #If  not training with demonstrations
-            self.pi_loss_tf = -tf.reduce_mean(self.main.Q_pi_tf)
-            self.pi_loss_tf += self.action_l2 * tf.reduce_mean(tf.square(self.main.pi_tf / self.max_u))
+            self.pi_loss_tf = -tf.reduce_mean(self.main1.Q_pi_tf)
+            self.pi_loss_tf += self.action_l2 * tf.reduce_mean(tf.square(self.main1.pi_tf / self.max_u))
 
-        Q_grads_tf = tf.gradients(self.Q_loss_tf, self._vars('main/Q'))
-        pi_grads_tf = tf.gradients(self.pi_loss_tf, self._vars('main/pi'))
-        assert len(self._vars('main/Q')) == len(Q_grads_tf)
-        assert len(self._vars('main/pi')) == len(pi_grads_tf)
-        self.Q_grads_vars_tf = zip(Q_grads_tf, self._vars('main/Q'))
-        self.pi_grads_vars_tf = zip(pi_grads_tf, self._vars('main/pi'))
-        self.Q_grad_tf = flatten_grads(grads=Q_grads_tf, var_list=self._vars('main/Q'))
-        self.pi_grad_tf = flatten_grads(grads=pi_grads_tf, var_list=self._vars('main/pi'))
+        Q1_grads_tf = tf.gradients(self.Q1_loss_tf, self._vars('main1/Q'))
+        Q2_grads_tf = tf.gradients(self.Q2_loss_tf, self._vars('main2/Q'))
+        pi_grads_tf = tf.gradients(self.pi_loss_tf, self._vars('main1/pi'))
+        assert len(self._vars('main1/Q')) == len(Q1_grads_tf)
+        assert len(self._vars('main2/Q')) == len(Q2_grads_tf)
+        assert len(self._vars('main1/pi')) == len(pi_grads_tf)
+        self.Q1_grads_vars_tf = zip(Q1_grads_tf, self._vars('main1/Q'))
+        self.Q2_grads_vars_tf = zip(Q2_grads_tf, self._vars('main2/Q'))
+        self.pi_grads_vars_tf = zip(pi_grads_tf, self._vars('main1/pi'))
+        self.Q1_grad_tf = flatten_grads(grads=Q1_grads_tf, var_list=self._vars('main1/Q'))
+        self.Q2_grad_tf = flatten_grads(grads=Q2_grads_tf, var_list=self._vars('main2/Q'))
+        self.pi_grad_tf = flatten_grads(grads=pi_grads_tf, var_list=self._vars('main1/pi'))
 
         # optimizers
-        self.Q_adam = MpiAdam(self._vars('main/Q'), scale_grad_by_procs=False)
-        self.pi_adam = MpiAdam(self._vars('main/pi'), scale_grad_by_procs=False)
+        self.Q1_adam = MpiAdam(self._vars('main1/Q'), scale_grad_by_procs=False)
+        self.Q2_adam = MpiAdam(self._vars('main2/Q'), scale_grad_by_procs=False)
+        self.pi_adam = MpiAdam(self._vars('main1/pi'), scale_grad_by_procs=False)
 
         # polyak averaging
-        self.main_vars = self._vars('main/Q') + self._vars('main/pi')
-        self.target1_vars = self._vars('target1/Q') + self._vars('target1/pi')
-        self.target2_vars = self._vars('target2/Q') + self._vars('target2/pi')
+        self.main_pi_vars = self._vars('main1/pi')
+        self.main_Q1_vars = self._vars('main1/Q')
+        self.main_Q2_vars = self._vars('main2/Q')
+
+        self.target_pi_vars = self._vars('target1/pi')
+        self.target1_vars = self._vars('target1/Q')
+        self.target2_vars = self._vars('target2/Q')
+
         self.stats_vars = self._global_vars('o_stats') + self._global_vars('g_stats')
+        self.init_pi_net_op = list(
+            map(lambda v: v[0].assign(v[1]), zip(self.target_pi_vars, self.main_pi_vars)))
         self.init_target1_net_op = list(
-            map(lambda v: v[0].assign(v[1]), zip(self.target1_vars, self.main_vars)))
+            map(lambda v: v[0].assign(v[1]), zip(self.target1_vars, self.main_Q1_vars)))
         self.init_target2_net_op = list(
-            map(lambda v: v[0].assign(v[1]), zip(self.target2_vars, self.main_vars)))
+            map(lambda v: v[0].assign(v[1]), zip(self.target2_vars, self.main_Q2_vars)))
+
+        self.update_pi_net_op = list(
+            map(lambda v: v[0].assign(self.polyak * v[0] + (1. - self.polyak) * v[1]), zip(self.target_pi_vars, self.main_pi_vars)))
         self.update_target1_net_op = list(
-            map(lambda v: v[0].assign(self.polyak * v[0] + (1. - self.polyak) * v[1]), zip(self.target1_vars, self.main_vars)))
+            map(lambda v: v[0].assign(self.polyak * v[0] + (1. - self.polyak) * v[1]), zip(self.target1_vars, self.main_Q1_vars)))
         self.update_target2_net_op = list(
-            map(lambda v: v[0].assign(self.polyak * v[0] + (1. - self.polyak) * v[1]), zip(self.target2_vars, self.main_vars)))
+            map(lambda v: v[0].assign(self.polyak * v[0] + (1. - self.polyak) * v[1]), zip(self.target2_vars, self.main_Q2_vars)))
 
         # initialize all variables
         tf.variables_initializer(self._global_vars('')).run()
