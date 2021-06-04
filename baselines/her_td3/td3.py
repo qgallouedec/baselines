@@ -103,6 +103,7 @@ class TD3(object):
         self.j = 0 # counter for policy delay
 
         buffer_size = (self.buffer_size // self.rollout_batch_size) * self.rollout_batch_size
+        # print(buffer_shapes) # {'o': (50, 6), 'u': (49, 3), 'g': (49, 3), 'info_is_success': (49, 1), 'ag': (50, 3)}
         self.buffer = ReplayBuffer(buffer_shapes, buffer_size, self.T, self.sample_transitions)
 
         global DEMO_BUFFER
@@ -262,6 +263,8 @@ class TD3(object):
         return critic1_loss, critic2_loss, actor_loss, Q1_grad, Q2_grad, pi_grad
 
     def _update(self, Q1_grad, Q2_grad, pi_grad):
+        with tf.Session() as sess:  print(self.main1._noise.eval()) 
+        # print(self.main1._noise)
         self.Q1_adam.update(Q1_grad, self.Q_lr)
         self.Q2_adam.update(Q2_grad, self.Q_lr)
         if self.j%self.policy_delay==0:
@@ -288,8 +291,14 @@ class TD3(object):
         transitions['o_2'], transitions['g_2'] = self._preprocess_og(o_2, ag_2, g)
 
         transitions_batch = [transitions[key] for key in self.stage_shapes.keys()]
-        # print(self.stage_shapes.keys()) # ['g', 'o', 'u', 'o_2', 'g_2', 'r']
-        #print(transitions_batch[0][0]) #= [[-0.13 -0.10  0.25], ..., [-0.02  0.12  0.16]]
+        # print([transitions_batch[i][0] for i in range(7)])
+        # [array([-0.11, -0.08,  0.04]),                      # 'g' : goal
+        # array([ 0.03,  0.02,  0.19, -0.22,  0.99, -1.13]),  # 'o' : obs
+        # array([0.22, 0.07, 0.11]),                          # 'u' : action                            
+        # array([ 0.03,  0.04,  0.16, -0.03, -0.23, -0.48]),  # 'o_2' : next obs
+        # array([-0.11, -0.08,  0.04]),                       # 'g_2' : goal in next step ? always identical to 'g'
+        # ???                                                 # 'noisy_u_2'
+        # -1.0]                                               # 'r' : reward
         return transitions_batch
 
     def stage_batch(self, batch=None):
@@ -393,26 +402,27 @@ class TD3(object):
         assert len(self._vars("main2")) == len(self._vars("target2"))
 
         # loss functions
-        target1_Q_pi_tf = self.target1.Q_pi_tf
-        target2_Q_pi_tf = self.target2.Q_pi_tf
-        target_Q_pi_tf = tf.minimum(target1_Q_pi_tf, target2_Q_pi_tf)
+        print(self.target1.Q_tf)
+        target1_Q_tf = self.target1.Q_tf
+        target2_Q_tf = self.target2.Q_tf
+        target_Q_tf = tf.minimum(target1_Q_tf, target2_Q_tf)
         clip_range = (-self.clip_return, 0. if self.clip_pos_returns else np.inf)
-        target_tf = tf.clip_by_value(batch_tf['r'] + self.gamma * target_Q_pi_tf, *clip_range)
+        target_tf = tf.clip_by_value(batch_tf['r'] + self.gamma * target_Q_tf, *clip_range)
 
         self.Q1_loss_tf = tf.reduce_mean(tf.square(tf.stop_gradient(target_tf) - self.main1.Q_tf)) #same target for both networks
         self.Q2_loss_tf = tf.reduce_mean(tf.square(tf.stop_gradient(target_tf) - self.main2.Q_tf))
 
         if self.bc_loss ==1 and self.q_filter == 1 : # train with demonstrations and use bc_loss and q_filter both
-            maskMain = tf.reshape(tf.boolean_mask(self.main1.Q_tf > self.main1.Q_pi_tf, mask), [-1]) #where is the demonstrator action better than actor action according to the critic? choose those samples only
+            maskMain = tf.reshape(tf.boolean_mask(self.main1.Q_tf > self.main1.Q_tf, mask), [-1]) #where is the demonstrator action better than actor action according to the critic? choose those samples only
             #define the cloning loss on the actor's actions only on the samples which adhere to the above masks
             self.cloning_loss_tf = tf.reduce_sum(tf.square(tf.boolean_mask(tf.boolean_mask((self.main1.pi_tf), mask), maskMain, axis=0) - tf.boolean_mask(tf.boolean_mask((batch_tf['u']), mask), maskMain, axis=0)))
-            self.pi_loss_tf = -self.prm_loss_weight * tf.reduce_mean(self.main1.Q_pi_tf) #primary loss scaled by it's respective weight prm_loss_weight
+            self.pi_loss_tf = -self.prm_loss_weight * tf.reduce_mean(self.main1.Q_tf) #primary loss scaled by it's respective weight prm_loss_weight
             self.pi_loss_tf += self.prm_loss_weight * self.action_l2 * tf.reduce_mean(tf.square(self.main1.pi_tf / self.max_u)) #L2 loss on action values scaled by the same weight prm_loss_weight
             self.pi_loss_tf += self.aux_loss_weight * self.cloning_loss_tf #adding the cloning loss to the actor loss as an auxilliary loss scaled by its weight aux_loss_weight
 
         elif self.bc_loss == 1 and self.q_filter == 0: # train with demonstrations without q_filter
             self.cloning_loss_tf = tf.reduce_sum(tf.square(tf.boolean_mask((self.main1.pi_tf), mask) - tf.boolean_mask((batch_tf['u']), mask)))
-            self.pi_loss_tf = -self.prm_loss_weight * tf.reduce_mean(self.main1.Q_pi_tf)
+            self.pi_loss_tf = -self.prm_loss_weight * tf.reduce_mean(self.main1.Q_tf)
             self.pi_loss_tf += self.prm_loss_weight * self.action_l2 * tf.reduce_mean(tf.square(self.main1.pi_tf / self.max_u))
             self.pi_loss_tf += self.aux_loss_weight * self.cloning_loss_tf
 
@@ -426,9 +436,9 @@ class TD3(object):
         assert len(self._vars('main1/Q')) == len(Q1_grads_tf)
         assert len(self._vars('main2/Q')) == len(Q2_grads_tf)
         assert len(self._vars('main1/pi')) == len(pi_grads_tf)
-        self.Q1_grads_vars_tf = zip(Q1_grads_tf, self._vars('main1/Q'))
-        self.Q2_grads_vars_tf = zip(Q2_grads_tf, self._vars('main2/Q'))
-        self.pi_grads_vars_tf = zip(pi_grads_tf, self._vars('main1/pi'))
+        # self.Q1_grads_vars_tf = zip(Q1_grads_tf, self._vars('main1/Q'))
+        # self.Q2_grads_vars_tf = zip(Q2_grads_tf, self._vars('main2/Q'))
+        # self.pi_grads_vars_tf = zip(pi_grads_tf, self._vars('main1/pi'))
         self.Q1_grad_tf = flatten_grads(grads=Q1_grads_tf, var_list=self._vars('main1/Q'))
         self.Q2_grad_tf = flatten_grads(grads=Q2_grads_tf, var_list=self._vars('main2/Q'))
         self.pi_grad_tf = flatten_grads(grads=pi_grads_tf, var_list=self._vars('main1/pi'))
