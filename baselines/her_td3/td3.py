@@ -22,7 +22,7 @@ global DEMO_BUFFER #buffer for demonstrations
 class TD3(object):
     @store_args
     def __init__(self, input_dims, buffer_size, hidden, layers, network_class, polyak, batch_size,
-                 Q_lr, pi_lr, norm_eps, norm_clip, max_u, action_l2, clip_obs, scope, T,
+                 Q_lr, pi_lr, norm_eps, norm_clip, noise_clip, policy_noise, max_u, action_l2, clip_obs, scope, T,
                  rollout_batch_size, subtract_goals, relative_goals, clip_pos_returns, clip_return,
                  bc_loss, q_filter, num_demo, demo_batch_size, prm_loss_weight, aux_loss_weight,
                  sample_transitions, gamma, reuse=False, policy_delay=2, **kwargs):
@@ -42,6 +42,8 @@ class TD3(object):
             pi_lr (float): learning rate for the pi (actor) network
             norm_eps (float): a small value used in the normalizer to avoid numerical instabilities
             norm_clip (float): normalized inputs are clipped to be in [-norm_clip, norm_clip]
+            noise_clip
+            policy_noise
             max_u (float): maximum action magnitude, i.e. actions are in [-max_u, max_u]
             action_l2 (float): coefficient for L2 penalty on the actions
             clip_obs (float): clip observations before normalization to be in [-clip_obs, clip_obs]
@@ -62,6 +64,7 @@ class TD3(object):
             prm_loss_weight: Weight corresponding to the primary loss
             aux_loss_weight: Weight corresponding to the auxilliary loss also called the cloning loss
         """
+        print(input_dims)
         if self.clip_return is None:
             self.clip_return = np.inf
 
@@ -78,7 +81,7 @@ class TD3(object):
             if key.startswith('info_'):
                 continue
             stage_shapes[key] = (None, *input_shapes[key])
-        for key in ['o', 'g']:
+        for key in ['o', 'g', 'u']:
             stage_shapes[key + '_2'] = stage_shapes[key]
         stage_shapes['r'] = (None,)
         self.stage_shapes = stage_shapes
@@ -122,6 +125,25 @@ class TD3(object):
         o = np.clip(o, -self.clip_obs, self.clip_obs)
         g = np.clip(g, -self.clip_obs, self.clip_obs)
         return o, g
+    
+    def _preprocess_u(self, o, g):
+        policy = self.target1
+        # values to compute
+        vals = [policy.pi_tf]
+        # feed
+        feed = {
+            policy.o_tf: o.reshape(-1, self.dimo),
+            policy.g_tf: g.reshape(-1, self.dimg),
+            policy.u_tf: np.zeros((o.size // self.dimo, self.dimu), dtype=np.float32)
+        }
+
+        u = self.sess.run(vals, feed_dict=feed)[0]
+        # action postprocessing
+        noise = np.clip(self.policy_noise*np.random.randn(*u.shape), -self.noise_clip, self.noise_clip)  # gaussian noise
+        u = np.clip(u + noise, -self.max_u, self.max_u)
+        return u
+
+
 
     def step(self, obs):
         actions = self.get_actions(obs['observation'], obs['achieved_goal'], obs['desired_goal'])
@@ -201,10 +223,11 @@ class TD3(object):
                 # add transitions to normalizer to normalize the demo data as well
                 episode['o_2'] = episode['o'][:, 1:, :]
                 episode['ag_2'] = episode['ag'][:, 1:, :]
+                episode['u_2'] = episode['u'][:, 1:, :]
                 num_normalizing_transitions = transitions_in_episode_batch(episode)
                 transitions = self.sample_transitions(episode, num_normalizing_transitions)
 
-                o, g, ag = transitions['o'], transitions['g'], transitions['ag']
+                o, g, ag  = transitions['o'], transitions['g'], transitions['ag']
                 transitions['o'], transitions['g'] = self._preprocess_og(o, ag, g)
                 # No need to preprocess the o_2 and g_2 since this is only used for stats
 
@@ -229,10 +252,11 @@ class TD3(object):
             # add transitions to normalizer
             episode_batch['o_2'] = episode_batch['o'][:, 1:, :]
             episode_batch['ag_2'] = episode_batch['ag'][:, 1:, :]
+            episode_batch['u_2'] = episode_batch['u'][:, 1:, :]
             num_normalizing_transitions = transitions_in_episode_batch(episode_batch)
             transitions = self.sample_transitions(episode_batch, num_normalizing_transitions)
 
-            o, g, ag = transitions['o'], transitions['g'], transitions['ag']
+            o, g, ag, u = transitions['o'], transitions['g'], transitions['ag'], transitions['u']
             transitions['o'], transitions['g'] = self._preprocess_og(o, ag, g)
             # No need to preprocess the o_2 and g_2 since this is only used for stats
 
@@ -263,7 +287,7 @@ class TD3(object):
         return critic1_loss, critic2_loss, actor_loss, Q1_grad, Q2_grad, pi_grad
 
     def _update(self, Q1_grad, Q2_grad, pi_grad):
-        with tf.Session() as sess:  print(self.main1._noise.eval()) 
+        # with tf.Session() as sess:  print(self.main1._noise.eval()) 
         # print(self.main1._noise)
         self.Q1_adam.update(Q1_grad, self.Q_lr)
         self.Q2_adam.update(Q2_grad, self.Q_lr)
@@ -284,12 +308,14 @@ class TD3(object):
             transitions = self.buffer.sample(self.batch_size) #otherwise only sample from primary buffer
         # print(len(transitions)) = 8
         # print(transitions.keys()) = 'o', 'u', 'g', 'info_is_success', 'ag', 'o_2', 'ag_2', 'r'
-        o, o_2, g = transitions['o'], transitions['o_2'], transitions['g']
+        o, o_2, g, u, u_2 = transitions['o'], transitions['o_2'], transitions['g'], transitions['u'], transitions['u_2'],
         # print(len(o)) = 256
         ag, ag_2 = transitions['ag'], transitions['ag_2']
         transitions['o'], transitions['g'] = self._preprocess_og(o, ag, g)
         transitions['o_2'], transitions['g_2'] = self._preprocess_og(o_2, ag_2, g)
-
+        # print(transitions['u'][20], '===========')
+        transitions['u_2'] = self._preprocess_u(o_2, g) #fuck
+        # print(transitions['u'][20])
         transitions_batch = [transitions[key] for key in self.stage_shapes.keys()]
         # print([transitions_batch[i][0] for i in range(7)])
         # [array([-0.11, -0.08,  0.04]),                      # 'g' : goal
@@ -299,6 +325,7 @@ class TD3(object):
         # array([-0.11, -0.08,  0.04]),                       # 'g_2' : goal in next step ? always identical to 'g'
         # ???                                                 # 'noisy_u_2'
         # -1.0]                                               # 'r' : reward
+
         return transitions_batch
 
     def stage_batch(self, batch=None):
@@ -385,8 +412,9 @@ class TD3(object):
             target1_batch_tf = batch_tf.copy()
             target1_batch_tf['o'] = batch_tf['o_2']
             target1_batch_tf['g'] = batch_tf['g_2']
+            target1_batch_tf['u'] = batch_tf['u_2']
             self.target1 = self.create_actor_critic(
-                target1_batch_tf, net_type='useless', **self.__dict__)
+                target1_batch_tf, net_type='target', **self.__dict__)
             vs.reuse_variables()
         assert len(self._vars("main1")) == len(self._vars("target1"))
 
@@ -396,13 +424,13 @@ class TD3(object):
             target2_batch_tf = batch_tf.copy()
             target2_batch_tf['o'] = batch_tf['o_2']
             target2_batch_tf['g'] = batch_tf['g_2']
+            target2_batch_tf['u'] = batch_tf['u_2']
             self.target2 = self.create_actor_critic(
-                target2_batch_tf, net_type='useless', **self.__dict__)
+                target2_batch_tf, net_type='target', **self.__dict__)
             vs.reuse_variables()
         assert len(self._vars("main2")) == len(self._vars("target2"))
 
         # loss functions
-        print(self.target1.Q_tf)
         target1_Q_tf = self.target1.Q_tf
         target2_Q_tf = self.target2.Q_tf
         target_Q_tf = tf.minimum(target1_Q_tf, target2_Q_tf)
@@ -449,13 +477,13 @@ class TD3(object):
         self.pi_adam = MpiAdam(self._vars('main1/pi'), scale_grad_by_procs=False)
 
         # polyak averaging
-        self.main_pi_vars = self._vars('main1/pi')
-        self.main_Q1_vars = self._vars('main1/Q')
-        self.main_Q2_vars = self._vars('main2/Q')
+        self.main_pi_vars = self._vars('main1/pi') # pi_1
+        self.main_Q1_vars = self._vars('main1/Q')  # Q_1
+        self.main_Q2_vars = self._vars('main2/Q')  # Q_2
 
-        self.target_pi_vars = self._vars('target1/pi')
-        self.target1_vars = self._vars('target1/Q')
-        self.target2_vars = self._vars('target2/Q')
+        self.target_pi_vars = self._vars('target1/pi') # pi_targ_1
+        self.target1_vars = self._vars('target1/Q')    # Q_targ_1
+        self.target2_vars = self._vars('target2/Q')    # Q_targ_2
 
         self.stats_vars = self._global_vars('o_stats') + self._global_vars('g_stats')
         self.init_pi_net_op = list(

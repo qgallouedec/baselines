@@ -39,9 +39,6 @@ class ActorCritic:
             input_Q = tf.concat(axis=1, values=[o, g, self.pi_tf / self.max_u])
             self.Q_pi_tf = nn(input_Q, [self.hidden] * self.layers + [1])
             # for critic training (Q_pi)
-            noise = tf.random.normal([256, self.dimu], stddev=0.2)
-            self._noise = noise # does not work, the noise is always the same
-            nu_tf = self.u_tf + noise
-            input_Q = tf.concat(axis=1, values=[o, g, nu_tf / self.max_u])
+            input_Q = tf.concat(axis=1, values=[o, g, self.u_tf / self.max_u])
             self._input_Q = input_Q  # exposed for tests
             self.Q_tf = nn(input_Q, [self.hidden] * self.layers + [1], reuse=True)

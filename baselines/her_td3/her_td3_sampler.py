@@ -25,7 +25,7 @@ def make_sample_her_td3_transitions(replay_strategy, replay_k, reward_fun):
 
         # Select which episodes and time steps to use.
         episode_idxs = np.random.randint(0, rollout_batch_size, batch_size)
-        t_samples = np.random.randint(T, size=batch_size)
+        t_samples = np.random.randint(T, size=batch_size)-1
         transitions = {key: episode_batch[key][episode_idxs, t_samples].copy()
                        for key in episode_batch.keys()}
 
