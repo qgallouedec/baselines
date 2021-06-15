@@ -48,6 +48,7 @@ DEFAULT_PARAMS = {
 
     'policy_noise': 0.2,
     'noise_clip': 0.5,
+    'double_Q_trick':True,
 
     'bc_loss': 0, # whether or not to use the behavior cloning loss as an auxilliary loss
     'q_filter': 0, # whether or not a Q value filter should be used on the Actor outputs
@@ -174,6 +175,7 @@ def configure_td3(dims, params, reuse=False, use_mpi=True, clip_return=True):
                         'gamma': gamma,
                         'policy_noise': params['policy_noise'],
                         'noise_clip': params['noise_clip'],
+                        'double_Q_trick': params['double_Q_trick'],
                         'bc_loss': params['bc_loss'],
                         'q_filter': params['q_filter'],
                         'num_demo': params['num_demo'],

@@ -46,9 +46,8 @@ DEFAULT_PARAMS = {
     'norm_eps': 0.01,  # epsilon used for observation normalization
     'norm_clip': 5,  # normalized observations are cropped to this values
 
-    'policy_noise': 0.2,
-    'noise_clip': 0.5,
     'alpha':0.2,
+    'double_Q_trick':True,
 
     'bc_loss': 0, # whether or not to use the behavior cloning loss as an auxilliary loss
     'q_filter': 0, # whether or not a Q value filter should be used on the Actor outputs
@@ -173,9 +172,8 @@ def configure_sac(dims, params, reuse=False, use_mpi=True, clip_return=True):
                         'subtract_goals': simple_goal_subtract,
                         'sample_transitions': sample_her_sac_transitions,
                         'gamma': gamma,
-                        'policy_noise': params['policy_noise'],
-                        'noise_clip': params['noise_clip'],
                         'alpha': params['alpha'],
+                        'double_Q_trick': params['double_Q_trick'],
                         'bc_loss': params['bc_loss'],
                         'q_filter': params['q_filter'],
                         'num_demo': params['num_demo'],

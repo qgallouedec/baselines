@@ -59,17 +59,21 @@ class ActorCritic:
             log_std = tf.clip_by_value(log_std, -20, 2)
             std = tf.exp(log_std)
             pi_tf = mu + tf.random_normal(tf.shape(mu)) * std
-            logp_pi_tf = gaussian_likelihood(pi_tf, mu, log_std)
-            self.mu, self.pi_tf, self.logp_pi_tf = apply_squashing_func(mu, pi_tf, logp_pi_tf)
-
+            log_pi_tf = gaussian_likelihood(pi_tf, mu, log_std)
+            self.mu, self.pi_tf, self.log_pi_tf = apply_squashing_func(mu, pi_tf, log_pi_tf)
+            
+            log_pi_u_tf = gaussian_likelihood(self.u_tf, mu, log_std)
+            _, _, self.log_pi_u_tf = apply_squashing_func(mu, pi_tf, log_pi_u_tf)
 
 
         with tf.variable_scope('Q'):
             # for policy training (V_pi)
-            input_Q = tf.concat(axis=1, values=[o, g, tf.stop_gradient(self.pi_tf) / self.max_u])
-            self.Q_pi_tf_sampled = nn(input_Q, [self.hidden] * self.layers + [1])
+            # input_Q = tf.concat(axis=1, values=[o, g, tf.stop_gradient(self.pi_tf) / self.max_u])
+            # self.Q_pi_tf_sampled = nn(input_Q, [self.hidden] * self.layers + [1])
+
+            # Q_pi(s, pi(s)) - not necessary V_pi since policy stochastic
             input_Q = tf.concat(axis=1, values=[o, g, self.pi_tf / self.max_u])
-            self.Q_pi_tf = nn(input_Q, [self.hidden] * self.layers + [1], reuse=True)
+            self.Q_pi_tf = nn(input_Q, [self.hidden] * self.layers + [1])
 
             # for critic training (Q_pi)
             input_Q = tf.concat(axis=1, values=[o, g, self.u_tf / self.max_u])

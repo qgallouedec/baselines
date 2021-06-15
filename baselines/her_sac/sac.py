@@ -22,10 +22,10 @@ global DEMO_BUFFER #buffer for demonstrations
 class SAC(object):
     @store_args
     def __init__(self, input_dims, buffer_size, hidden, layers, network_class, polyak, batch_size,
-                 Q_lr, pi_lr, norm_eps, norm_clip, noise_clip, policy_noise, alpha, max_u, action_l2, clip_obs, scope, T,
+                 Q_lr, pi_lr, norm_eps, norm_clip, max_u, action_l2, clip_obs, scope, T,
                  rollout_batch_size, subtract_goals, relative_goals, clip_pos_returns, clip_return,
                  bc_loss, q_filter, num_demo, demo_batch_size, prm_loss_weight, aux_loss_weight,
-                 sample_transitions, gamma, reuse=False, **kwargs):
+                 sample_transitions, gamma, alpha, double_Q_trick, reuse=False, **kwargs):
         """Implementation of SAC that is used in combination with Hindsight Experience Replay (HER).
             Added functionality to use demonstrations for training to Overcome exploration problem.
 
@@ -42,15 +42,12 @@ class SAC(object):
             pi_lr (float): learning rate for the pi (actor) network
             norm_eps (float): a small value used in the normalizer to avoid numerical instabilities
             norm_clip (float): normalized inputs are clipped to be in [-norm_clip, norm_clip]
-            noise_clip
-            policy_noise
-            alpha
             max_u (float): maximum action magnitude, i.e. actions are in [-max_u, max_u]
             action_l2 (float): coefficient for L2 penalty on the actions
             clip_obs (float): clip observations before normalization to be in [-clip_obs, clip_obs]
             scope (str): the scope used for the TensorFlow graph
             T (int): the time horizon for rollouts
-            rollout_batch_size (int): number of parallel rollouts per sac agent
+            rollout_batch_size (int): number of parallel rollouts per SAC agent
             subtract_goals (function): function that subtracts goals from each other
             relative_goals (boolean): whether or not relative goals should be fed into the network
             clip_pos_returns (boolean): whether or not positive returns should be clipped
@@ -83,7 +80,6 @@ class SAC(object):
             stage_shapes[key] = (None, *input_shapes[key])
         for key in ['o', 'g', 'u']:
             stage_shapes[key + '_2'] = stage_shapes[key]
-        stage_shapes['logpu_2'] = (None,)
         stage_shapes['r'] = (None,)
         self.stage_shapes = stage_shapes
 
@@ -105,7 +101,6 @@ class SAC(object):
         buffer_shapes['ag'] = (self.T, self.dimg)
 
         buffer_size = (self.buffer_size // self.rollout_batch_size) * self.rollout_batch_size
-        # print(buffer_shapes) # {'o': (50, 6), 'u': (49, 3), 'g': (49, 3), 'info_is_success': (49, 1), 'ag': (50, 3)}
         self.buffer = ReplayBuffer(buffer_shapes, buffer_size, self.T, self.sample_transitions)
 
         global DEMO_BUFFER
@@ -124,11 +119,12 @@ class SAC(object):
         o = np.clip(o, -self.clip_obs, self.clip_obs)
         g = np.clip(g, -self.clip_obs, self.clip_obs)
         return o, g
-    
+
     def _preprocess_u(self, o, g):
+        """Sample an a' with pi_theta """
         policy = self.main1
         # values to compute
-        vals = [policy.pi_tf, policy.logp_pi_tf]
+        vals = [policy.pi_tf]
         # feed
         feed = {
             policy.o_tf: o.reshape(-1, self.dimo),
@@ -136,13 +132,11 @@ class SAC(object):
             policy.u_tf: np.zeros((o.size // self.dimo, self.dimu), dtype=np.float32)
         }
 
-        u, logp_pi_tf = self.sess.run(vals, feed_dict=feed)
+        u = self.sess.run(vals, feed_dict=feed)[0]
         # action postprocessing
         # noise = np.clip(self.policy_noise*np.random.randn(*u.shape), -self.noise_clip, self.noise_clip)  # gaussian noise
         # u = np.clip(u + noise, -self.max_u, self.max_u)
-        return u, logp_pi_tf
-
-
+        return u
 
     def step(self, obs):
         actions = self.get_actions(obs['observation'], obs['achieved_goal'], obs['desired_goal'])
@@ -152,7 +146,6 @@ class SAC(object):
     def get_actions(self, o, ag, g, noise_eps=0., random_eps=0., use_target_net=False,
                     compute_Q=False):
         o, g = self._preprocess_og(o, ag, g)
-        assert not use_target_net
         policy = self.target1 if use_target_net else self.main1
         # values to compute
         vals = [policy.pi_tf]
@@ -183,66 +176,6 @@ class SAC(object):
         else:
             return ret
 
-
-    def init_demo_buffer(self, demoDataFile, update_stats=True): #function that initializes the demo buffer
-
-        demoData = np.load(demoDataFile) #load the demonstration data from data file
-        info_keys = [key.replace('info_', '') for key in self.input_dims.keys() if key.startswith('info_')]
-        info_values = [np.empty((self.T - 1, 1, self.input_dims['info_' + key]), np.float32) for key in info_keys]
-
-        demo_data_obs = demoData['obs']
-        demo_data_acs = demoData['acs']
-        demo_data_info = demoData['info']
-
-        for epsd in range(self.num_demo): # we initialize the whole demo buffer at the start of the training
-            obs, acts, goals, achieved_goals = [], [] ,[] ,[]
-            i = 0
-            for transition in range(self.T - 1):
-                obs.append([demo_data_obs[epsd][transition].get('observation')])
-                acts.append([demo_data_acs[epsd][transition]])
-                goals.append([demo_data_obs[epsd][transition].get('desired_goal')])
-                achieved_goals.append([demo_data_obs[epsd][transition].get('achieved_goal')])
-                for idx, key in enumerate(info_keys):
-                    info_values[idx][transition, i] = demo_data_info[epsd][transition][key]
-
-
-            obs.append([demo_data_obs[epsd][self.T - 1].get('observation')])
-            achieved_goals.append([demo_data_obs[epsd][self.T - 1].get('achieved_goal')])
-
-            episode = dict(o=obs,
-                           u=acts,
-                           g=goals,
-                           ag=achieved_goals)
-            for key, value in zip(info_keys, info_values):
-                episode['info_{}'.format(key)] = value
-
-            episode = convert_episode_to_batch_major(episode)
-            global DEMO_BUFFER
-            DEMO_BUFFER.store_episode(episode) # create the observation dict and append them into the demonstration buffer
-            logger.debug("Demo buffer size currently ", DEMO_BUFFER.get_current_size()) #print out the demonstration buffer size
-
-            if update_stats:
-                # add transitions to normalizer to normalize the demo data as well
-                episode['o_2'] = episode['o'][:, 1:, :]
-                episode['ag_2'] = episode['ag'][:, 1:, :]
-                episode['u_2'] = episode['u'][:, 1:, :]
-                episode['logpu_2'] = episode['u'][:, 1:, :]
-                num_normalizing_transitions = transitions_in_episode_batch(episode)
-                transitions = self.sample_transitions(episode, num_normalizing_transitions)
-
-                o, g, ag  = transitions['o'], transitions['g'], transitions['ag']
-                transitions['o'], transitions['g'] = self._preprocess_og(o, ag, g)
-                # No need to preprocess the o_2 and g_2 since this is only used for stats
-
-                self.o_stats.update(transitions['o'])
-                self.g_stats.update(transitions['g'])
-
-                self.o_stats.recompute_stats()
-                self.g_stats.recompute_stats()
-            episode.clear()
-
-        logger.info("Demo buffer size: ", DEMO_BUFFER.get_current_size()) #print out the demonstration buffer size
-
     def store_episode(self, episode_batch, update_stats=True):
         """
         episode_batch: array of batch_size x (T or T+1) x dim_key
@@ -259,7 +192,7 @@ class SAC(object):
             num_normalizing_transitions = transitions_in_episode_batch(episode_batch)
             transitions = self.sample_transitions(episode_batch, num_normalizing_transitions)
 
-            o, g, ag, u = transitions['o'], transitions['g'], transitions['ag'], transitions['u']
+            o, g, ag = transitions['o'], transitions['g'], transitions['ag']
             transitions['o'], transitions['g'] = self._preprocess_og(o, ag, g)
             # No need to preprocess the o_2 and g_2 since this is only used for stats
 
@@ -290,8 +223,6 @@ class SAC(object):
         return critic1_loss, critic2_loss, actor_loss, Q1_grad, Q2_grad, pi_grad
 
     def _update(self, Q1_grad, Q2_grad, pi_grad):
-        # with tf.Session() as sess:  print(self.main1._noise.eval()) 
-        # print(self.main1._noise)
         self.Q1_adam.update(Q1_grad, self.Q_lr)
         self.Q2_adam.update(Q2_grad, self.Q_lr)
         self.pi_adam.update(pi_grad, self.pi_lr)
@@ -308,25 +239,14 @@ class SAC(object):
                 transitions[k] = np.array(rolloutV)
         else:
             transitions = self.buffer.sample(self.batch_size) #otherwise only sample from primary buffer
-        # print(len(transitions)) = 8
-        # print(transitions.keys()) = 'o', 'u', 'g', 'info_is_success', 'ag', 'o_2', 'ag_2', 'r'
+
         o, o_2, g = transitions['o'], transitions['o_2'], transitions['g']
-        # print(len(o)) = 256
         ag, ag_2 = transitions['ag'], transitions['ag_2']
         transitions['o'], transitions['g'] = self._preprocess_og(o, ag, g)
         transitions['o_2'], transitions['g_2'] = self._preprocess_og(o_2, ag_2, g)
-        # print(transitions['u'][20], '===========')
-        transitions['u_2'], transitions['logpu_2'] = self._preprocess_u(o_2, g) #fuck
-        # print(transitions['u'][20])
-        transitions_batch = [transitions[key] for key in self.stage_shapes.keys()]
-        # print([transitions_batch[i][0] for i in range(7)])
-        # [array([-0.11, -0.08,  0.04]),                      # 'g' : goal
-        # array([ 0.03,  0.02,  0.19, -0.22,  0.99, -1.13]),  # 'o' : obs
-        # array([0.22, 0.07, 0.11]),                          # 'u' : action                            
-        # array([ 0.03,  0.04,  0.16, -0.03, -0.23, -0.48]),  # 'o_2' : next obs
-        # array([-0.11, -0.08,  0.04]),                       # 'g_2' : goal in next step ? always identical to 'g'
-        # -1.0]                                               # 'r' : reward
+        transitions['u_2'] = self._preprocess_u(o_2, g)
 
+        transitions_batch = [transitions[key] for key in self.stage_shapes.keys()]
         return transitions_batch
 
     def stage_batch(self, batch=None):
@@ -347,7 +267,6 @@ class SAC(object):
     
     def _init_target2_net(self):
         self.sess.run(self.init_target2_net_op)
-
 
     def update_target1_net(self):
         self.sess.run(self.update_target1_net_op)
@@ -387,9 +306,6 @@ class SAC(object):
                                 for i, key in enumerate(self.stage_shapes.keys())])
         batch_tf['r'] = tf.reshape(batch_tf['r'], [-1, 1])
 
-        #choose only the demo buffer samples
-        mask = np.concatenate((np.zeros(self.batch_size - self.demo_batch_size), np.ones(self.demo_batch_size)), axis = 0)
-
         # networks
         with tf.variable_scope('main1', reuse=tf.AUTO_REUSE) as vs:
             if reuse:
@@ -402,11 +318,6 @@ class SAC(object):
             self.main1_next = self.create_actor_critic(main1_next_batch_tf, net_type='main', **self.__dict__)
             vs.reuse_variables()
 
-        with tf.variable_scope('main2') as vs:
-            if reuse:
-                vs.reuse_variables()
-            self.main2 = self.create_actor_critic(batch_tf, net_type='main', **self.__dict__)
-            vs.reuse_variables()
         with tf.variable_scope('target1') as vs:
             if reuse:
                 vs.reuse_variables()
@@ -418,7 +329,12 @@ class SAC(object):
                 target1_batch_tf, net_type='target', **self.__dict__)
             vs.reuse_variables()
         assert len(self._vars("main1")) == len(self._vars("target1"))
-
+        
+        with tf.variable_scope('main2') as vs:
+            if reuse:
+                vs.reuse_variables()
+            self.main2 = self.create_actor_critic(batch_tf, net_type='main', **self.__dict__)
+            vs.reuse_variables()
         with tf.variable_scope('target2') as vs:
             if reuse:
                 vs.reuse_variables()
@@ -434,18 +350,27 @@ class SAC(object):
         # loss functions
         target1_Q_tf = self.target1.Q_tf
         target2_Q_tf = self.target2.Q_tf
-        target_Q_tf = tf.minimum(target1_Q_tf, target2_Q_tf) - self.alpha * batch_tf['logpu_2']
+        log_pi_u_tf = self.main1_next.log_pi_u_tf # we use main1_next because the state for the log is s'
+        
+        if self.double_Q_trick:
+            target_Q_pi_tf = tf.minimum(target1_Q_tf, target2_Q_tf) - self.alpha*log_pi_u_tf # cata when alpha!=0
+        else:
+            target_Q_pi_tf = target1_Q_tf - self.alpha*log_pi_u_tf
+        
         clip_range = (-self.clip_return, 0. if self.clip_pos_returns else np.inf)
-        target_tf = tf.clip_by_value(batch_tf['r'] + self.gamma * target_Q_tf, *clip_range)
-
-        self.Q1_loss_tf = tf.reduce_mean(tf.square(tf.stop_gradient(target_tf) - self.main1.Q_tf)) #same target for both networks
+        target_tf = tf.clip_by_value(batch_tf['r'] + self.gamma * target_Q_pi_tf, *clip_range)
+        self.Q1_loss_tf = tf.reduce_mean(tf.square(tf.stop_gradient(target_tf) - self.main1.Q_tf))
         self.Q2_loss_tf = tf.reduce_mean(tf.square(tf.stop_gradient(target_tf) - self.main2.Q_tf))
 
         main1_Q_tf = self.main1.Q_pi_tf
         main2_Q_tf = self.main2.Q_pi_tf
-        self.target_pi = tf.minimum(main1_Q_tf, main2_Q_tf) #- self.alpha * batch_tf['logpu_2'] ### IL NE RESTE PLSU QUE CA A INT2GRER
+        log_pi_tf = self.main1.log_pi_tf
+        if self.double_Q_trick:
+            self.target_pi = tf.minimum(main1_Q_tf, main2_Q_tf) - self.alpha * log_pi_tf
+        else:
+            self.target_pi = main1_Q_tf - self.alpha * log_pi_tf
+        
         self.pi_loss_tf = -tf.reduce_mean(self.target_pi)
-        #self.pi_loss_tf = -tf.reduce_mean(self.main1.Q_pi_tf)
         self.pi_loss_tf += self.action_l2 * tf.reduce_mean(tf.square(self.main1.pi_tf / self.max_u))
 
         Q1_grads_tf = tf.gradients(self.Q1_loss_tf, self._vars('main1/Q'))
@@ -467,7 +392,8 @@ class SAC(object):
         self.pi_adam = MpiAdam(self._vars('main1/pi'), scale_grad_by_procs=False)
 
         # polyak averaging
-        self.main_pi_vars = self._vars('main1/pi') # pi_1
+        self.pi_vars = self._vars('main1/pi') # pi_1
+
         self.main_Q1_vars = self._vars('main1/Q')  # Q_1
         self.main_Q2_vars = self._vars('main2/Q')  # Q_2
 
@@ -507,7 +433,7 @@ class SAC(object):
         """Our policies can be loaded from pkl, but after unpickling you cannot continue training.
         """
         excluded_subnames = ['_tf', '_op', '_vars', '_adam', 'buffer', 'sess', '_stats',
-                             'main', 'target1', 'target2', 'lock', 'env', 'sample_transitions',
+                             'main1', 'target1', 'target2', 'lock', 'env', 'sample_transitions',
                              'stage_shapes', 'create_actor_critic']
 
         state = {k: v for k, v in self.__dict__.items() if all([not subname in k for subname in excluded_subnames])}
