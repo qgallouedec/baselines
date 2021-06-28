@@ -1,4 +1,6 @@
-**Status:** Maintenance (expect bug fixes and minor updates)
+**My fork of OpenAI baselines, including TD3 and SAC**
+
+**Status: Obsolete, please do not use**
 
 <img src="data/logo.jpg" width=25% align="right" /> [![Build status](https://travis-ci.org/openai/baselines.svg?branch=master)](https://travis-ci.org/openai/baselines)
 
